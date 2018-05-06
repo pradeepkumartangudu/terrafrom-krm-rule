@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: 'AT&T CSO Astra AWS Satellite Component: Delete Default VPCs across all regions'
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Region to delete default VPC'
+      Parameters:
+      - Region
+
+Parameters:
+  Region:
+    Description: The AWS regions to delete the default VPC
+    Type: String
+    Default: All
+    AllowedValues: [All,ap-northeast-1,ap-northeast-2,ap-south-1,ap-southeast-1,ap-southeast-2,ca-central-1,eu-central-1,eu-west-1,eu-west-2,eu-west-3,sa-east-1,us-east-1,us-east-2,us-west-1,us-west-2]
+
+Conditions:
+  DoAll: !Equals [!Ref Region, All]
+  DoApNortheast1: !Or [!Equals [!Ref Region, ap-northeast-1], Condition: DoAll]
+  DoApNortheast2: !Or [!Equals [!Ref Region, ap-northeast-2], Condition: DoAll]
+  DoApSouth1: !Or [!Equals [!Ref Region, ap-south-1], Condition: DoAll]
+  DoApSoutheast1: !Or [!Equals [!Ref Region, ap-southeast-1], Condition: DoAll]
+  DoApSoutheast2: !Or [!Equals [!Ref Region, ap-southeast-2], Condition: DoAll]
+  DoCaCentral1: !Or [!Equals [!Ref Region, ca-central-1], Condition: DoAll]
+  DoEuCentral1: !Or [!Equals [!Ref Region, eu-central-1], Condition: DoAll]
+  DoEuWest1: !Or [!Equals [!Ref Region, eu-west-1], Condition: DoAll]
+  DoEuWest2: !Or [!Equals [!Ref Region, eu-west-2], Condition: DoAll]
+  DoEuWest3: !Or [!Equals [!Ref Region, eu-west-3], Condition: DoAll]
+  DoSaEast1: !Or [!Equals [!Ref Region, sa-east-1], Condition: DoAll]
+  DoUsEast1: !Or [!Equals [!Ref Region, us-east-1], Condition: DoAll]
+  DoUsEast2: !Or [!Equals [!Ref Region, us-east-2], Condition: DoAll]
+  DoUsWest1: !Or [!Equals [!Ref Region, us-west-1], Condition: DoAll]
+  DoUsWest2: !Or [!Equals [!Ref Region, us-west-2], Condition: DoAll]
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: ec2Vpc
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:DescribeInternetGateways
+            - ec2:DetachInternetGateway
+            - ec2:DescribeSubnets
+            - ec2:DeleteSubnet
+            - ec2:DescribeVpcs
+            - ec2:DeleteVpc
+            Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: ATT CSO ASTRA Compliance Delete Default VPCs CloudFormation custom AWS Lambda function.
+      Code:
+        ZipFile:
+          |
+            'use strict';
+            const AWS = require('aws-sdk');
+            const response = require('cfn-response');
+
+            const Regions = ['ap-northeast-1', 'ap-northeast-2', 'ap-south-1', 'ap-southeast-1', 'ap-southeast-2', 'ca-central-1', 'eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'sa-east-1', 'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2'];
+
+            var ec2 = null;
+
+            const getDefaultVpcId = (results) => {
+              var {VpcId} = results.Vpcs.find( vpc => vpc.IsDefault ) || {};
+              return VpcId;
+            };
+
+            const getAttachedInternetGateways = (vpcId) => {
+              if (vpcId == undefined)
+                return Promise.resolve({vpcId: undefined, igws: undefined});
+              var params = {
+                Filters: [
+                  { Name: 'attachment.vpc-id', Values: [ vpcId ] }
+                ]
+              };
+              return ec2.describeInternetGateways(params).promise()
+              .then(results => Promise.resolve({vpcId: vpcId, igws: results.InternetGateways}));
+            };
+
+            const detachInternetGateways = ({vpcId, igws}) => {
+              if (vpcId == undefined)
+                return Promise.resolve();
+              if (igws == undefined)
+                return Promise.resolve(vpcId);
+              var promises = [];
+              for (var {InternetGatewayId} of igws) {
+                var params = {
+                  InternetGatewayId: InternetGatewayId,
+                  VpcId: vpcId
+                };
+                promises.push(ec2.detachInternetGateway(params).promise());
+              }
+              return Promise.all(promises).then(values => Promise.resolve(vpcId));
+            };
+
+            const getAttachedSubnets = (vpcId) => {
+              if (vpcId == undefined)
+                return Promise.resolve({vpcId: undefined, subnets: undefined});
+              var params = {
+                Filters: [
+                  { Name: 'vpc-id', Values: [ vpcId ] }
+                ]
+              };
+              return ec2.describeSubnets(params).promise()
+                .then(results => Promise.resolve({vpcId: vpcId, subnets: results.Subnets}));
+            };
+
+            const deleteSubnets = ({vpcId, subnets}) => {
+              if (vpcId == undefined)
+                return Promise.resolve();
+              if (subnets == undefined)
+                return Promise.resolve(vpcId);
+              var promises = [];
+              for (var {SubnetId} of subnets) {
+                var params = {
+                  SubnetId: SubnetId
+                };
+                promises.push(ec2.deleteSubnet(params).promise());
+              }
+              return Promise.all(promises).then(values => Promise.resolve(vpcId));
+            };
+
+            const deleteDefaultVpcId = (vpcId) => {
+              if (vpcId == undefined)
+                return Promise.resolve();
+              var params = {
+                VpcId: vpcId
+              };
+              return ec2.deleteVpc(params).promise().then(data => Promise.resolve())
+            };
+
+            exports.handler = (event, context, cb) => {
+              console.log(`Invoke: ${JSON.stringify(event)}`);
+              const done = (err) => {
+                if (err) {
+                  if (err instanceof Error)
+                    console.log(`Error: ${err.message}`);
+                  else
+                    console.log(`Error: ${JSON.stringify(err)}`);
+                  response.send(event, context, response.FAILED, {});
+                } else {
+                  response.send(event, context, response.SUCCESS, {});
+                }
+              };
+
+              // Check for valid AWS Region
+              const region = event.ResourceProperties.Region;
+              if (Regions.indexOf(region) < 0) {
+                done(`Invalid AWS Region: ${region}`);
+                return;
+              }
+
+              ec2 = new AWS.EC2({
+                apiVersion: '2016-11-15',
+                region: region
+              });
+
+              if (event.RequestType === 'Create' || event.RequestType === 'Update') {
+                ec2.describeVpcs().promise()
+                .then(getDefaultVpcId)
+                .then(getAttachedInternetGateways)
+                .then(detachInternetGateways)
+                .then(getAttachedSubnets)
+                .then(deleteSubnets)
+                .then(deleteDefaultVpcId)
+                .then(done)
+                .catch(done)
+              } else {
+                // For Delete request, immediately send a SUCCESS response.
+                done();
+              }
+            };
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs6.10
+      Timeout: 60
+      Tags:
+        - Key: Purpose
+          Value: ATT CSO ASTRA Compliance Delete Default VPCs Lambda Function
+        - Key: CloudFormationTemplateName
+          Value: ATT CSO ASTRA DeleteDefaultVPCs
+
+  ApNortheast1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::ApNortheast1DeleteVpcs
+    Version: 1.0
+    Condition: DoApNortheast1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ap-northeast-1
+
+  ApNortheast2DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::ApNortheast2DeleteVpcs
+    Version: 1.0
+    Condition: DoApNortheast2
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ap-northeast-2
+
+  ApSouth1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::ApSouth1DeleteVpcs
+    Version: 1.0
+    Condition: DoApSouth1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ap-south-1
+
+  ApSoutheast1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::ApSoutheast1DeleteVpcs
+    Version: 1.0
+    Condition: DoApSoutheast1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ap-southeast-1
+
+  ApSoutheast2DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::ApSoutheast2DeleteVpcs
+    Version: 1.0
+    Condition: DoApSoutheast2
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ap-southeast-2
+
+  CaCentral1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::CaCentral1DeleteVpcs
+    Version: 1.0
+    Condition: DoCaCentral1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: ca-central-1
+
+  EuCentral1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::EuCentral1DeleteVpcs
+    Version: 1.0
+    Condition: DoEuCentral1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: eu-central-1
+
+  EuWest1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::EuWest1DeleteVpcs
+    Version: 1.0
+    Condition: DoEuWest1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: eu-west-1
+
+  EuWest2DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::EuWest2DeleteVpcs
+    Version: 1.0
+    Condition: DoEuWest2
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: eu-west-2
+
+  EuWest3DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::EuWest3DeleteVpcs
+    Version: 1.0
+    Condition: DoEuWest3
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: eu-west-3
+
+  SaEast1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::SaEast1DeleteVpcs
+    Version: 1.0
+    Condition: DoSaEast1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: sa-east-1
+
+  UsEast1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::UsEast1DeleteVpcs
+    Version: 1.0
+    Condition: DoUsEast1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: us-east-1
+
+  UsEast2DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::UsEast2DeleteVpcs
+    Version: 1.0
+    Condition: DoUsEast2
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: us-east-2
+
+  UsWest1DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::UsWest1DeleteVpcs
+    Version: 1.0
+    Condition: DoUsWest1
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: us-west-1
+
+  UsWest2DeleteVpcs:
+    DependsOn: LambdaFunction
+    Type: Custom::UsWest2DeleteVpcs
+    Version: 1.0
+    Condition: DoUsWest2
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: us-west-2
